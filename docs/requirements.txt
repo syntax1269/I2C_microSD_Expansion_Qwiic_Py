@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 I2C microSD Expansion contributors
+#
+# SPDX-License-Identifier: MIT
+
+sphinx
+sphinxcontrib-jquery
+sphinx-rtd-theme

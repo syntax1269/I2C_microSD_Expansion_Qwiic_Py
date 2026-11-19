@@ -339,6 +339,12 @@ Deep protocol detail is in the [wiki](wiki/Home.md).
 
 ---
 
+## Documentation
+
+Full API documentation is published at https://i2c-microsd-expansion-qwiic-py.readthedocs.io/ and can be built locally with `Sphinx <https://www.sphinx-doc.org/>`_ from `docs/`.
+
+---
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Not affiliated with the SD Association.

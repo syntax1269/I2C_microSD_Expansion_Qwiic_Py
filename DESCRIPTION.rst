@@ -1,5 +1,5 @@
 qwiic_sd_expansion_py
-=============
+=====================
 
 Python module for the I2C microSD Expansion: SD-card storage over just 2
 wires (I2C), with expansion-pin control and a module-side WS2812B bit-bang
