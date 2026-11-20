@@ -6,12 +6,15 @@ The module has an on-board bit-bang engine that generates timed pin waveforms
 1. driving WS2812B ("NeoPixel") LED strips, and
 2. playing a small token script for custom timed pin edges.
 
-Because the waveform is generated on the module with interrupts masked, timing is
-far more precise than toggling a GPIO over I²C. This page documents the raw
-commands; the libraries expose them as `show_neopixels()`, `bitbang_*()` etc.
+The waveform is generated on the module by a cycle-exact assembly emitter, so its
+timing is far more precise than toggling a GPIO over I²C. Since firmware 18.8.33
+the TWI (I²C) interrupt stays enabled during a blit - see **Interrupt behaviour**
+below. This page documents the raw commands; the libraries expose them as
+`show_neopixels()`, `bitbang_*()` etc.
 
 Requires module firmware **18.5.2** or newer. The "send only buffered bytes"
 behavior (so clearing the workspace really darkens the strip) needs **18.8.0**.
+Continuous chases (`0x03`) need **18.8.41** (ATtiny3224) / **19.2.5** (AVR64DD20).
 
 ## The 256-byte workspace
 
@@ -36,7 +39,7 @@ The workspace aliases the formatter/probe sector buffer, so `BITBANG_BUFFER`
 |---|---|---|---|
 | `0x2B` | `BITBANG_SET_MODE` | 1 B pin ID | Select data pin: PA5=`5`, PB2=`2`, PB3=`3` |
 | `0x2C` | `BITBANG_BUFFER` | `[offL, offH, len, ...data]` | Copy `len` bytes to workspace at `offset` |
-| `0x2D` | `BITBANG_EXECUTE` | 1 B profile | Run profile `1` (NeoPixel) or `2` (script) |
+| `0x2D` | `BITBANG_EXECUTE` | 1 B profile | Run profile `1` (NeoPixel), `2` (script), or `3` (continuous NeoPixel loop) |
 | `0x2E` | `BITBANG_CLEAR` | none | Zero workspace and reset the length mark |
 
 The header (`offset` low, `offset` high, `len`) and payload of `0x2C` travel in
@@ -105,13 +108,51 @@ W [0x2D, 0x02]                 # EXECUTE script profile
 delay(2100)                    # 5 * 400 ms; keep bus quiet
 ```
 
+## 3. Continuous chase (profile 3)
+
+Profile `3` re-clocks the buffered frame forever, so the module generates a
+running chase with **no host involvement** after one frame has been uploaded:
+
+```
+W [0x10, 0x00]                 # PA5 = digital output (or 0x12/PA6, 0x14/PA7)
+W [0x2B, 0x05]                 # engine data pin = PA5
+W [0x2E]                       # CLEAR workspace / length mark
+W [0x2C, 0x00, 0x00, ...]      # one GRB frame (3 bytes per pixel)
+W [0x2D, 0x03]                 # EXECUTE NEO_LOOP
+# ... the strip now chases continuously ...
+W [0x2E]                       # CLEAR stops the loop and darkens the strip
+```
+
+**Interrupt behaviour.** The TWI ISR stays enabled throughout the chase. An
+incoming transaction preempts the emitter, is serviced from the ISR's RAM
+state, and the emitter resumes at the next bit; SCL is held only for the
+ISR's few-microsecond latency. Closing the TWI interrupt (per pixel or per
+frame) was tried and rejected: it lost CLEAR/STOP and left the chase
+unstoppable over I2C.
+
+**Scheduling and file I/O.** The chase is limited to about 30 frames/s and
+rotates one GRB pixel per frame, so an uploaded rainbow frame becomes a
+moving chase. File operations queued while a chase is running are not
+processed until `BITBANG_CLEAR` stops it; use host-driven profile 1 frames
+when storage I/O must overlap with LED output.
+
+The watchdog is fed once per frame, so the chase survives indefinitely even
+with no I2C traffic. `BITBANG_CLEAR (0x2E)` is the stop control. Do not rewrite
+the workspace (`0x2C`) while a loop is running - CLEAR first, then upload the
+new frame.
+
 ## Constraints and safety
 
-- **Interrupts are masked** while a frame or script runs; the module's millis
-  tick and TWI peripheral are deaf. Start **no I²C traffic** until execution
-  finishes, or a command will be lost or split the waveform.
-- The module's watchdog is about **8.2 s**; keep scripts well inside that.
-- While a frame/script plays the module NACKs I²C — expected, not a fault.
+- **TWI interrupt stays enabled** since firmware 18.8.33. Commands are ACKed
+  during a blit; only the millis tick is masked. Profile 1 (single frame) can
+  have its colours split by mid-frame I2C traffic - keep the bus quiet for
+  ~30 us/pixel plus the latch reset, or use profile 3 for a continuous chase.
+- Profile 3 keeps the TWI ISR enabled and runs at ~30 fps. Transactions are
+  never dropped; queued file operations complete after CLEAR stops the chase.
+- Scripts and profile 3 feed the watchdog themselves (18.8.37+), so long or
+  looping runs no longer reset at 8 s. Still provide a stop (`0x2E`) for
+  unbounded scripts.
+- A rejected `BITBANG_BUFFER` during format/probe is expected; retry later.
 - `BITBANG_BUFFER` may NACK while a format/probe owns the shared block; retry.
 
 ## Troubleshooting

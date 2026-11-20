@@ -31,9 +31,13 @@ W addr [ cmd, payload... ]        write transaction (STOP at end)
 R addr [ cmd ] -> n bytes         write cmd, repeated START, read n bytes
 ```
 
-A "clock stretch" (the module holding SCL low) is normal while it copies a
-payload into RAM or stages a response. Allow stretches of at least a few
-milliseconds; a full card format can stretch much longer.
+The module uses **standard I²C clock stretching**: it holds SCL low only for the
+few microseconds needed to copy a byte into RAM or stage a response — typically
+**well under ~10 µs per byte**. This is normal, spec-compliant behaviour that
+any I²C master must support. A `FORMAT` is a long *operation*, but it does not
+hold SCL low for its duration; poll STATUS for completion. Host-specific
+caveats are covered in
+[Clock stretching and Raspberry Pi hosts](#clock-stretching-and-raspberry-pi-hosts).
 
 ### The two transaction shapes
 
@@ -48,6 +52,31 @@ milliseconds; a full card format can stretch much longer.
 
 Some commands (pin control, `SAVEEEPROM`, `FORMAT`, `REBOOT`) take no payload and
 are sent as a bare command byte + STOP.
+
+### Clock stretching and Raspberry Pi hosts
+
+The I²C host peripheral in **BCM2835 / BCM2836 / BCM2837 / BCM2711** — the
+Broadcom BSC block used by Raspberry Pi 1, 2, 3, 4 and the matching Compute
+Modules — has a **silicon bug** in its hardware handling of clock stretching.
+A stretching slave such as this module can yield short reads, spurious NACKs
+or timeouts on those hosts, even though it works correctly on other
+controllers. This is a bug in the host silicon, not in the module.
+
+- **Pi 5 / CM5:** no workaround needed. The RP1 southbridge uses **Synopsys
+  DesignWare I²C** controllers, which handle clock stretching correctly.
+- **Pi 4 and earlier:** switch to the bit-banged software I²C bus by adding
+  this line to `/boot/config.txt` (Raspberry Pi OS Bookworm and later:
+  `/boot/firmware/config.txt`), then reboot:
+
+  ```ini
+  dtoverlay=i2c-gpio
+  ```
+
+  The `i2c-gpio` driver is not affected by the Broadcom bug. It uses BCM pins
+  2 (SDA) and 3 (SCL) by default; if the hardware bus is also enabled, either
+  disable it with `dtparam=i2c_arm=off` or move the software bus to other pins.
+  After rebooting, re-scan with `i2cdetect` and point your code at the new
+  `/dev/i2c-N` device.
 
 ## 2. Command map
 

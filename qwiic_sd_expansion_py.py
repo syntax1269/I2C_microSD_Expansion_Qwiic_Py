@@ -68,7 +68,29 @@ import time
 import qwiic_i2c
 
 # Host-library version (kept in sync with setup.py and the other ports).
-__version__ = "1.0.3"
+__version__ = "1.0.8"
+
+# ---- Non-blocking API types ----------------------------------------------
+ASYNC_IOERR = -2   # STATUS read failed
+ASYNC_BUSY = -1    # operation not finished yet
+ASYNC_OK = 0       # operation completed with no error
+
+OP_OPEN_WRITE = 1
+OP_OPEN_READ = 2
+OP_CLOSE = 3
+OP_FORMAT = 4
+OP_QUERY = 5
+
+
+class AsyncOp:
+    """Token returned by a begin_*() call; pass to poll_op()."""
+    __slots__ = ("done_before", "kind")
+
+    def __init__(self):
+        self.done_before = 0
+        self.kind = 0
+
+
 
 #===============================================================================
 # Device identification
@@ -388,6 +410,11 @@ def _le16(b, off):
 def _le32(b, off):
     return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)
 
+def _diag_bytes(n):
+    """Format a byte count like the ESP32 gateway's cardinfo."""
+    return "%.1f MiB / %.2f GiB" % (n / 1048576.0, n / 1073741824.0)
+
+
 
 #===============================================================================
 class QwiicSDExpansion(object):
@@ -476,6 +503,7 @@ class QwiicSDExpansion(object):
                 self._raw_read = raw
         self._last_error = MicroSDExpError.OK
         self._file_open = False
+        self._async_pending = False
         self._append_mode = False
         self._read_started = False
         self._base_written = 0
@@ -689,6 +717,11 @@ class QwiicSDExpansion(object):
         :rtype: int
         """
         return self._last_error
+
+    @property
+    def last_ok(self):
+        """True when the most recent call completed without error."""
+        return self._last_error == MicroSDExpError.OK
 
     @property
     def sticky_error(self):
@@ -1055,41 +1088,38 @@ class QwiicSDExpansion(object):
             return False
         return self._legacy_op(MICROSDEXP_CMD_REMOVE_FILE, path)[0] == 0
 
-    def exists(self, path):
-        """
-        :param path: File or directory path on the card
-        :type path: str
-        :return: `True` if the path exists
-        :rtype: bool
-        """
+    def exists_checked(self, path):
+        """Return (ok, exists). ``ok`` is False on I2C/card/path error."""
         if not self.valid_path(path):
-            return False
+            return (False, False)
         err, res = self._legacy_op(MICROSDEXP_CMD_FILE_EXISTS, path, want_result=True)
-        return err == 0 and res == 1
+        return (err == 0, err == 0 and res == 1)
+
+    def exists(self, path):
+        """True if the path exists. On error returns False — check last_ok."""
+        return self.exists_checked(path)[1]
+
+    def file_size_checked(self, path):
+        """Return (ok, size_bytes). ``ok`` distinguishes 0 bytes from an error."""
+        if not self.valid_path(path):
+            return (False, 0)
+        err, res = self._legacy_op(MICROSDEXP_CMD_FILE_SIZE, path, want_result=True)
+        return (err == 0, res if err == 0 else 0)
 
     def file_size(self, path):
-        """
-        :param path: File path on the card
-        :type path: str
-        :return: The file size in bytes, 0 if not found
-        :rtype: int
-        """
+        """Size in bytes, 0 if not found or on error — check last_ok."""
+        return self.file_size_checked(path)[1]
+
+    def is_directory_checked(self, path):
+        """Return (ok, is_directory). ``ok`` is False on error."""
         if not self.valid_path(path):
-            return 0
-        err, res = self._legacy_op(MICROSDEXP_CMD_FILE_SIZE, path, want_result=True)
-        return res if err == 0 else 0
+            return (False, False)
+        err, res = self._legacy_op(MICROSDEXP_CMD_IS_DIRECTORY, path, want_result=True)
+        return (err == 0, err == 0 and res == 1)
 
     def is_directory(self, path):
-        """
-        :param path: Path on the card
-        :type path: str
-        :return: `True` if the path is a directory
-        :rtype: bool
-        """
-        if not self.valid_path(path):
-            return False
-        err, res = self._legacy_op(MICROSDEXP_CMD_IS_DIRECTORY, path, want_result=True)
-        return err == 0 and res == 1
+        """True if the path is a directory — check last_ok on error."""
+        return self.is_directory_checked(path)[1]
 
     def firmware_banner(self):
         """
@@ -1212,6 +1242,224 @@ class QwiicSDExpansion(object):
         out.sck_hz = _le32(buf, 20)
         self._last_error = MicroSDExpError.OK
         return out
+
+    def diagnostics(self):
+        """
+        Return a one-page health report for troubleshooting.
+
+        Reports module presence, firmware and protocol version, card/filesystem
+        state, capacity and free space, the bound I2C address and a communication
+        verdict. Safe to call before ``begin()``: fields that could not be read
+        are shown as ``n/a``. The call does not change ``last_error``.
+
+        Free space uses the module's ``free_clusters`` value; a reported 0 means
+        unknown (scan pending) or a full card, so the report says ``unknown``.
+        The Qwiic bus speed is owned by the host driver, so it is shown as
+        ``n/a (host bus)``.
+        """
+        preserved = self.last_error
+        lines = ["I2C microSD Expansion", "---------------------"]
+        st = self.read_status()
+        lines.append("Module detected:   %s" % ("yes" if st is not None else "no"))
+        lines.append("Protocol version:  %s" % (str(st.rev) if st is not None else "n/a"))
+
+        fw = self.version()
+        lines.append("Firmware version:  %s" % (fw if fw else "unknown"))
+
+        ci = self.card_info()
+        lines.append("SD card detected:  %s" % ("yes" if ci is not None and ci.mounted else "no"))
+        if ci is not None:
+            fat_names = {12: "FAT12", 16: "FAT16", 32: "FAT32", 64: "exFAT"}
+            lines.append("Filesystem:        %s" % fat_names.get(ci.fat_type, "unknown"))
+            capacity = ci.sector_count * 512
+            lines.append("Capacity:          %s" % (
+                _diag_bytes(capacity) if capacity else "n/a"))
+            if ci.cluster_count > 0 and ci.free_clusters > 0:
+                cluster = ((capacity // ci.cluster_count + 256) // 512) * 512
+                lines.append("Free space:        %s" % _diag_bytes(ci.free_clusters * cluster))
+            elif ci.free_clusters == 0:
+                lines.append("Free space:        unknown")
+            else:
+                lines.append("Free space:        n/a")
+        else:
+            lines.extend(["Filesystem:        n/a",
+                          "Capacity:          n/a",
+                          "Free space:        n/a"])
+
+        lines.append("I2C address:       0x%02X" % self.address)
+        lines.append("I2C speed:         n/a (host bus)")
+        lines.append("Communication:     %s" % (
+            "OK" if st is not None and st.error == 0 else "CHECK"))
+
+        self._last_error = preserved
+        return "\n".join(lines)
+
+    # ---- Non-blocking API (no sleeps; call from your loop) -----------------
+    def _async_submit_open(self, cmd, path, op, kind):
+        if self._async_pending or not self.valid_path(path):
+            return False
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return False
+        try:
+            raw = path.encode("ascii") + b"\x00"
+        except (UnicodeEncodeError, AttributeError):
+            self._last_error = MicroSDExpError.INVALID
+            return False
+        if not self._write(bytes([cmd]) + raw):
+            return False
+        op.done_before = st.op_done
+        op.kind = kind
+        self._async_pending = True
+        self._append_mode = False
+        self._read_started = False
+        self._written = 0
+        self._file_open = kind in (OP_OPEN_WRITE, OP_OPEN_READ)
+        self._last_error = MicroSDExpError.OK
+        return True
+
+    def begin_open_write(self, path, op):
+        """Submit OPEN_WRITE without waiting; poll with poll_op()."""
+        return self._async_submit_open(MICROSDEXP_CMD_OPEN_WRITE, path, op, OP_OPEN_WRITE)
+
+    def begin_open_read(self, path, op):
+        """Submit OPEN_READ without waiting; poll with poll_op()."""
+        return self._async_submit_open(MICROSDEXP_CMD_OPEN_READ, path, op, OP_OPEN_READ)
+
+    def begin_close(self, op):
+        """Submit CLOSE_FLUSH without waiting; poll with poll_op()."""
+        if self._async_pending or not self._file_open:
+            return False
+        if self._append_mode:  # append chunks are atomic; no module op
+            self._file_open = False
+            self._append_mode = False
+            self._read_started = False
+            self._last_error = MicroSDExpError.OK
+            return False
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return False
+        if not self._write(bytes([MICROSDEXP_CMD_CLOSE_FLUSH])):
+            return False
+        op.done_before = st.op_done
+        op.kind = OP_CLOSE
+        self._async_pending = True
+        return True
+
+    def begin_format(self, mode, op):
+        """Submit FORMAT without waiting (destructive)."""
+        if mode not in (0, 1) or self._async_pending:
+            self._last_error = MicroSDExpError.INVALID
+            return False
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return False
+        if not self._write(bytes([MICROSDEXP_CMD_FORMAT, mode])):
+            return False
+        op.done_before = st.op_done
+        op.kind = OP_FORMAT
+        self._async_pending = True
+        return True
+
+    def begin_query(self, cmd, path, op):
+        """Submit a queued command (optionally with a path) without waiting."""
+        if self._async_pending:
+            return False
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return False
+        if path and not self._submit_filename(path):
+            return False
+        if not self._write(bytes([cmd])):
+            return False
+        op.done_before = st.op_done
+        op.kind = OP_QUERY
+        self._async_pending = True
+        return True
+
+    def poll_op(self, op):
+        """One STATUS read: ASYNC_BUSY, ASYNC_OK, module error, or ASYNC_IOERR."""
+        st = self.read_status()
+        if st is None:
+            return ASYNC_IOERR
+        if st.op_done == op.done_before:
+            return ASYNC_BUSY
+        if not self._async_pending:
+            return st.error
+        self._async_pending = False
+        if op.kind == OP_OPEN_WRITE:
+            self._base_written = st.result
+        elif op.kind == OP_OPEN_READ:
+            self._base_written = st.result
+            self._write(bytes([MICROSDEXP_CMD_READ]))  # prime the stream
+            self._read_started = True
+        elif op.kind == OP_CLOSE:
+            self._file_open = False
+            self._read_started = False
+        if st.error == 0:
+            self._last_error = MicroSDExpError.OK
+        else:
+            self._last_error = (MicroSDExpError.OPEN_FAIL
+                                if st.error == MICROSDEXP_ERR_OPEN
+                                else MicroSDExpError.CARD_ERR)
+        return st.error
+
+    def write_now(self, data):
+        """Push at most one chunk if RX has room now. Returns bytes accepted."""
+        if not data or not self._file_open or self._async_pending:
+            if not self._file_open:
+                self._last_error = MicroSDExpError.NO_FILE
+            return 0
+        if self._append_mode:
+            self._last_error = MicroSDExpError.INVALID
+            return 0
+        chunk = bytes(data[:CHUNK_BYTES])
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return 0
+        if st.state == MICROSDEXP_ST_ERROR:
+            self._last_error = MicroSDExpError.CARD_ERR
+            return 0
+        if st.rx_free < len(chunk):
+            return 0  # would block
+        if not self._write(bytes([MICROSDEXP_CMD_WRITE]) + chunk):
+            return 0
+        self._written += len(chunk)
+        self._last_error = MicroSDExpError.OK
+        return len(chunk)
+
+    def read_now(self, n):
+        """Drain only what is staged right now. Returns bytes (b"" = try later)."""
+        if n <= 0 or not self._file_open or not self._read_started or self._async_pending:
+            return b""
+        st = self.read_status()
+        if st is None:
+            self._last_error = MicroSDExpError.NO_MODULE
+            return b""
+        if st.state == MICROSDEXP_ST_ERROR:
+            self._last_error = MicroSDExpError.CARD_ERR
+            return b""
+        if st.tx_avail == 0:
+            return b""
+        want = min(st.tx_avail, n, self._read_chunk)
+        chunk = self._read(MICROSDEXP_CMD_READ, want)
+        if chunk is None:
+            self._last_error = MicroSDExpError.CARD_ERR
+            got_bytes = b""
+        else:
+            got_bytes = bytes(chunk[:want])
+        self._last_error = MicroSDExpError.OK
+        return got_bytes
+
+    def committed_bytes(self):
+        """Committed byte count from one STATUS read (0 on I/O error)."""
+        st = self.read_status()
+        return st.result if st is not None else 0
 
     def list_dir(self, path, max_entries=64):
         """

@@ -50,9 +50,16 @@ it sees the STOP condition, so a transaction must contain the command byte and
 its whole payload followed by one STOP. Splitting a `WRITE` payload across two
 STOPs sends two separate WRITE operations.
 
-Clock stretching is normal: the module pulls SCL low while it copies bytes into
-RAM. Your I²C peripheral must tolerate stretching for several milliseconds; for
-`FORMAT` it can stretch for tens of seconds.
+Clock stretching is normal: the module pulls SCL low only while it copies a byte
+into RAM or stages a response — typically **well under ~10 µs per byte**. Any
+spec-compliant I²C master must support it. `FORMAT` is a long *operation*, but it
+does not hold SCL low the whole time; poll STATUS for completion.
+
+> **Raspberry Pi hosts:** the Broadcom BSC controller (BCM2835–BCM2711,
+> Pi 4 and earlier) has a **silicon bug** with clock stretching. Add
+> `dtoverlay=i2c-gpio` to `/boot/config.txt` to use the bit-banged bus, or use a
+> Pi 5 (RP1 / Synopsys DesignWare I²C), which is unaffected. See
+> [Clock stretching and Raspberry Pi hosts](Protocol-Reference.md#clock-stretching-and-raspberry-pi-hosts).
 
 ## 3. Two ways to write a file
 
